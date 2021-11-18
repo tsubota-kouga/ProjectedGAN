@@ -1,0 +1,8 @@
+
+.env
+.vim
+*.model
+__pycache__/
+datasets/
+log/
+model/
