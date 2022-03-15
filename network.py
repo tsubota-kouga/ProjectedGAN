@@ -19,10 +19,6 @@ class Print(nn.Module):
         print(self.prompt, ">>>", input.shape)
         return input
 
-class Swish(nn.Module):
-    def forward(self, input):
-        return input * torch.sigmoid(input)
-
 
 class Activation(nn.Module):
     activation: Union[nn.Module, Callable[[Any], torch.Tensor]]
@@ -43,7 +39,7 @@ class Activation(nn.Module):
         elif activation == "tanh":
             self.activation = nn.Tanh()
         elif activation == "swish":
-            self.activation = Swish()
+            self.activation = nn.SiLU()
         else:
             assert False, f"unsupported activation: {activation}"
 
@@ -69,14 +65,14 @@ class UpsampleBlock(nn.Module):
         super(UpsampleBlock, self).__init__()
         self.net = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(
+            spectral_norm(nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels * 2,
                 kernel_size=3,
                 stride=1,
                 padding=1,
                 padding_mode="replicate",
-                bias=False),
+                bias=False)),
             nn.BatchNorm2d(num_features=out_channels * 2),
             nn.GLU(dim=1))
 
@@ -89,25 +85,25 @@ class UpsampleBlock2(nn.Module):
         super(UpsampleBlock2, self).__init__()
         self.net = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(
+            spectral_norm(nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels * 2,
                 kernel_size=3,
                 stride=1,
                 padding=1,
                 padding_mode="replicate",
-                bias=False),
+                bias=False)),
             # NoiseBlock(),
             # nn.BatchNorm2d(num_features=out_channels * 2),
             # nn.GLU(dim=1),
-            # nn.Conv2d(
+            # spectral_norm(nn.Conv2d(
             #     in_channels=out_channels,
             #     out_channels=out_channels * 2,
             #     kernel_size=3,
             #     stride=1,
             #     padding=1,
             #     padding_mode="replicate",
-            #     bias=False),
+            #     bias=False)),
             NoiseBlock(),
             nn.BatchNorm2d(num_features=out_channels * 2),
             nn.GLU(dim=1))
@@ -121,17 +117,17 @@ class SkipLayerExcitation(nn.Module):
         super(SkipLayerExcitation, self).__init__()
         self.channel_wise = nn.Sequential(
             nn.AdaptiveAvgPool2d(output_size=(4, 4)),
-            nn.Conv2d(
+            spectral_norm(nn.Conv2d(
                 in_channels=feature_channels,
                 out_channels=in_channels,
                 kernel_size=4,
-                bias=False),
-            Swish(),
-            nn.Conv2d(
+                bias=False)),
+            nn.SiLU(),
+            spectral_norm(nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=in_channels,
                 kernel_size=1,
-                bias=False),
+                bias=False)),
             nn.Sigmoid())
 
     def forward(self, input: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
@@ -142,11 +138,11 @@ class Generator(nn.Module):
     def __init__(self, channels_info: List[Tuple[int, int]], latent_dim: int = 256):
         super(Generator, self).__init__()
         self.conv_trans = nn.Sequential(
-            nn.ConvTranspose2d(
+            spectral_norm(nn.ConvTranspose2d(
                 in_channels=latent_dim,
                 out_channels=channels_info[0][0] * 2,
                 kernel_size=4,
-                bias=False),
+                bias=False)),
             nn.BatchNorm2d(num_features=channels_info[0][0] * 2),
             nn.GLU(dim=1))
         self.feature_layers = (len(channels_info) - 2) // 2
@@ -163,14 +159,14 @@ class Generator(nn.Module):
                 channels_info[self.pre_upsample_layers - 1:
                              self.pre_upsample_layers + self.feature_layers - 1])])
         self.out = nn.Sequential(
-            nn.Conv2d(
+            spectral_norm(nn.Conv2d(
                 in_channels=channels_info[-1][1],
                 out_channels=3,
                 kernel_size=3,
                 stride=1,
                 padding=1,
                 padding_mode="replicate",
-                bias=False))
+                bias=False)))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x = F.normalize(input, dim=1)
@@ -193,7 +189,8 @@ class Projector(nn.Module):
                  projected_channels: List[int],
                  model_name: str = "tf_efficientnet_lite1"):
         super(Projector, self).__init__()
-        self.model = timm.create_model(model_name, pretrained=True)
+        self.num_use_features = len(projected_channels)
+        self.model = timm.create_model(model_name, pretrained=True, features_only=True)
         self.ccm = nn.ModuleList([
             nn.Conv2d(
                 in_channels=in_channels,
@@ -212,49 +209,26 @@ class Projector(nn.Module):
                     padding=1,
                     bias=False),
                 nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False))
-            if i != 0 else
-                nn.Conv2d(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False)
-            for i, (in_channels, out_channels) in
-                enumerate(zip(
-                    [projected_channels[-1], *projected_channels[::-1]],
-                    projected_channels[::-1],
-                    ))])
+            for in_channels, out_channels in
+                zip(
+                    projected_channels[1:][::-1],
+                    projected_channels[:-1][::-1],
+                    )])
         for module in self.csm:
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_uniform_(module.weight.data, a=0.2)
             else:
                 nn.init.kaiming_uniform_(module[0].weight.data, a=0.2)
 
-    def forward(self, input: torch.Tensor
-            ) -> Tuple[torch.Tensor,
-                       torch.Tensor,
-                       torch.Tensor,
-                       torch.Tensor]:
-        x = self.model.conv_stem(input)
-        x = self.model.bn1(x)
-        x = self.model.act1(x)
-        x64 = self.model.blocks[0:2](x)
-        x32 = self.model.blocks[2](x64)
-        x16 = self.model.blocks[3:5](x32)
-        x8 = self.model.blocks[5:](x16)
-        x8 = self.model.conv_head(x8)
-        x8 = self.model.bn2(x8)
+    def forward(self, input: torch.Tensor) -> List[torch.Tensor]:
+        xs = []
+        for ccm, x in zip(self.ccm, self.model(input)[-self.num_use_features:]):
+            xs.append(ccm(x))
 
-        x64 = self.ccm[0](x64)
-        x32 = self.ccm[1](x32)
-        x16 = self.ccm[2](x16)
-        x8 = self.ccm[3](x8)
-
-        x8 = self.csm[0](x8)
-        x16 = self.csm[1](x8) + x16
-        x32 = self.csm[2](x16) + x32
-        x64 = self.csm[3](x32) + x64
-        return x64, x32, x16, x8
+        ys: List[torch.Tensor] = [xs[-1]]
+        for csm, x in zip(self.csm, xs[:-1][::-1]):
+            ys.append(csm(ys[-1]) + x)
+        return ys
 
 class DownBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, slope: float = 0.2):
@@ -269,8 +243,9 @@ class DownBlock(nn.Module):
                 padding_mode="replicate",
                 bias=False)),
             nn.BatchNorm2d(num_features=out_channels),
-            # nn.LeakyReLU(negative_slope=slope, inplace=True),
-            Swish())
+            nn.LeakyReLU(negative_slope=slope, inplace=True),
+            # nn.SiLU()
+            )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return self.net(input)
@@ -281,80 +256,24 @@ class Discriminator(nn.Module):
                  projected_channels: List[int],
                  channel_info: List[Tuple[int, int]]):
         super(Discriminator, self).__init__()
-        in_channels64, in_channels32, in_channels16, in_channels8 = projected_channels
-        self.model64 = nn.Sequential(
-            DownBlock(
-                in_channels=in_channels64,
-                out_channels=channel_info[0][0])
-            ,*[
+        self.models = nn.ModuleList([
+            nn.Sequential(DownBlock(
+                in_channels=model_in_channels,
+                out_channels=channel_info[idx][0]
+                    if idx < len(channel_info) else channel_info[idx - 1][1]),
+                        # channel_info[last + 1][0] == channel_info[last][1]
+            *[
                 DownBlock(
                     in_channels=in_channels,
                     out_channels=out_channels)
-                for in_channels, out_channels in channel_info
+                for in_channels, out_channels in channel_info[idx:]
             ],
-            spectral_norm(
-                nn.Conv2d(
+            spectral_norm(nn.Conv2d(
                     in_channels=channel_info[-1][1],
                     out_channels=1,
                     kernel_size=4)))
-        self.model32 = nn.Sequential(
-            DownBlock(
-                in_channels=in_channels32,
-                out_channels=channel_info[1][0])
-            ,*[
-                DownBlock(
-                    in_channels=in_channels,
-                    out_channels=out_channels)
-                for in_channels, out_channels in channel_info[1:]
-            ],
-            spectral_norm(
-                nn.Conv2d(
-                    in_channels=channel_info[-1][1],
-                    out_channels=1,
-                    kernel_size=4)))
-        self.model16 = nn.Sequential(
-            DownBlock(
-                in_channels=in_channels16,
-                out_channels=channel_info[2][0])
-            ,*[
-                DownBlock(
-                    in_channels=in_channels,
-                    out_channels=out_channels)
-                for in_channels, out_channels in channel_info[2:]
-            ],
-            spectral_norm(
-                nn.Conv2d(
-                    in_channels=channel_info[-1][1],
-                    out_channels=1,
-                    kernel_size=4)))
-        self.model8 = nn.Sequential(
-            DownBlock(
-                in_channels=in_channels8,
-                # channel_info[3][0] == channel_info[2][1]
-                out_channels=channel_info[2][1])
-            ,*[
-                DownBlock(
-                    in_channels=in_channels,
-                    out_channels=out_channels)
-                for in_channels, out_channels in channel_info[3:]
-            ],
-            spectral_norm(
-                nn.Conv2d(
-                    in_channels=channel_info[-1][1],
-                    out_channels=1,
-                    kernel_size=4)))
+            for idx, model_in_channels in enumerate(projected_channels)])
 
-    def forward(self,
-                input64: torch.Tensor,
-                input32: torch.Tensor,
-                input16: torch.Tensor,
-                input8: torch.Tensor
-            ) -> Tuple[torch.Tensor,
-                       torch.Tensor,
-                       torch.Tensor,
-                       torch.Tensor]:
-        return self.model64(input64), \
-               self.model32(input32), \
-               self.model16(input16), \
-               self.model8(input8)
+    def forward(self, *inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [model(input) for model, input in zip(self.models, inputs[::-1])]
 

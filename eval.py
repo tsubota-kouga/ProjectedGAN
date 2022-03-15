@@ -1,4 +1,5 @@
 
+import numpy as np
 import sys
 import argparse
 
@@ -12,6 +13,9 @@ from network import Generator
 from utils import adjust_dynamic_range, load_generator
 
 if __name__ == "__main__":
+    torch.manual_seed(0)
+    np.random.seed(0)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=str, default=None)
     args = parser.parse_args()
@@ -20,7 +24,7 @@ if __name__ == "__main__":
         channels_info=hp.generator_channels_info,
         latent_dim=hp.latent_dim
         ).to(hp.device)
-    generator = load_generator(generator, eval_mode=True, path=args.path)
+    load_generator(generator, eval_mode=True, path=args.path)
     generator.eval()
 
     with torch.inference_mode():
